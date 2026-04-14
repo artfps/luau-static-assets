@@ -1,6 +1,6 @@
-local OWNER = "__REPO_OWNER__"
+local OWNER = "artfps"
 local REPO = "luau-static-assets"
-local PINNED_COMMIT = "__PINNED_COMMIT__"
+local PINNED_COMMIT = "e3fbe24d91732db8510cfebcd6e856d7525ffd1c"
 local BASE = string.format("https://raw.githubusercontent.com/%s/%s/%s", OWNER, REPO, PINNED_COMMIT)
 
 if getgenv().BridgeURL == nil then
