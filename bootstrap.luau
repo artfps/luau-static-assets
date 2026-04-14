@@ -1,5 +1,5 @@
 local OWNER = "__REPO_OWNER__"
-local REPO = "roblox-executor-mcp-assets"
+local REPO = "luau-static-assets"
 local PINNED_COMMIT = "__PINNED_COMMIT__"
 local BASE = string.format("https://raw.githubusercontent.com/%s/%s/%s", OWNER, REPO, PINNED_COMMIT)
 
@@ -16,11 +16,11 @@ if getgenv().DisableInitialScriptDecompMapping == nil then
 end
 
 if getgenv().LocalRegExpSource == nil then
-    getgenv().LocalRegExpSource = game:HttpGet(BASE .. "/RegExp.luau")
+    getgenv().LocalRegExpSource = game:HttpGet(BASE .. "/pattern_engine.luau")
 end
 
 if getgenv().LocalCobaltSource == nil then
-    getgenv().LocalCobaltSource = game:HttpGet(BASE .. "/Cobalt.luau")
+    getgenv().LocalCobaltSource = game:HttpGet(BASE .. "/trace_bundle.luau")
 end
 
-loadstring(game:HttpGet(BASE .. "/connector.luau"))()
+loadstring(game:HttpGet(BASE .. "/bridge.luau"))()
