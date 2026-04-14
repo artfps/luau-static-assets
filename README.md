@@ -23,7 +23,7 @@ Do not load from a floating branch URL if you can avoid it.
 Use a pinned commit URL instead:
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/__REPO_OWNER__/luau-static-assets/__BOOTSTRAP_COMMIT__/bootstrap.luau"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/artfps/luau-static-assets/2d4fea4a980aa9782478994ebee6fa6b6a735941/bootstrap.luau"))()
 ```
 
 The bootstrap itself then pulls `bridge.luau`, `pattern_engine.luau`, and `trace_bundle.luau` from a pinned commit.
