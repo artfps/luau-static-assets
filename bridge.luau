@@ -5,8 +5,69 @@ end
 
 --// Variables \\--
 local BridgeURL = getgenv().BridgeURL or ... or "localhost:16384"
+local BridgeToken = getgenv().BridgeToken
 local HttpServiceForEncoding = game:GetService("HttpService")
 local LocalVendorRoot = getgenv().LocalVendorRoot
+
+local function TrimTrailingSlashes(value)
+    if type(value) ~= "string" then
+        return value
+    end
+
+    return (string.gsub(value, "/+$", ""))
+end
+
+local function NormalizeBridgeBases(rawUrl)
+    if type(rawUrl) ~= "string" or rawUrl == "" then
+        return "http://localhost:16384", "ws://localhost:16384"
+    end
+
+    local normalized = TrimTrailingSlashes(rawUrl)
+    if string.match(normalized, "^https?://") then
+        return normalized, (normalized:gsub("^http://", "ws://"):gsub("^https://", "wss://"))
+    end
+
+    if string.match(normalized, "^wss?://") then
+        return (normalized:gsub("^ws://", "http://"):gsub("^wss://", "https://")), normalized
+    end
+
+    return "http://" .. normalized, "ws://" .. normalized
+end
+
+local HTTPBridgeBaseURL, WSBridgeBaseURL = NormalizeBridgeBases(BridgeURL)
+
+local function AppendQueryParam(url, key, value)
+    if type(value) ~= "string" or value == "" then
+        return url
+    end
+
+    local delimiter = string.find(url, "?", 1, true) and "&" or "?"
+    return url .. delimiter .. key .. "=" .. HttpServiceForEncoding:UrlEncode(value)
+end
+
+local function BuildBridgeHeaders(extraHeaders)
+    local headers = extraHeaders or {}
+    if type(BridgeToken) == "string" and BridgeToken ~= "" then
+        headers["X-Bridge-Token"] = BridgeToken
+    end
+    return headers
+end
+
+local function BuildHttpBridgeUrl(path, params)
+    local url = HTTPBridgeBaseURL .. path
+    if type(params) == "table" then
+        for key, value in pairs(params) do
+            if value ~= nil then
+                url = AppendQueryParam(url, tostring(key), tostring(value))
+            end
+        end
+    end
+    return url
+end
+
+local function BuildWebSocketBridgeUrl()
+    return AppendQueryParam(WSBridgeBaseURL, "bridgeToken", BridgeToken)
+end
 
 local VendoredRelativePaths = {
     LocalRegExp = "LuauRegExp/RegExp.luau",
@@ -455,8 +516,9 @@ local BaseBridge = {}; do
             local response
             local thread = task.spawn(function()
                 local success, data = pcall(request, {
-                    Url = "http://" .. BridgeURL,
-                    Method = "GET"
+                    Url = HTTPBridgeBaseURL,
+                    Method = "GET",
+                    Headers = BuildBridgeHeaders()
                 })
 
                 if success then
@@ -514,7 +576,7 @@ local WebSocketBridge = setmetatable({}, {__index = BaseBridge}); do
         local wsConnection = nil
         local connectionThread = task.spawn(function()
             local success, result = pcall(function()
-                return WebSocket.connect("ws://" .. BridgeURL)
+                return WebSocket.connect(BuildWebSocketBridgeUrl())
             end)
             if success then
                 wsConnection = result
@@ -613,9 +675,9 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
         --// Register with the server \\--
         pcall(function()
             local regResponse = request({
-                Url = "http://" .. BridgeURL .. "/register",
+                Url = BuildHttpBridgeUrl("/register"),
                 Method = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
+                Headers = BuildBridgeHeaders({ ["Content-Type"] = "application/json" }),
                 Body = HttpService:JSONEncode(GetRegistrationInfo()),
             })
             if regResponse.StatusCode == 200 and regResponse.Body then
@@ -630,13 +692,13 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
             
             while self.Connected do
                 local success, _ = pcall(function()
-                    local pollUrl = "http://" .. BridgeURL .. "/poll"
-                    if self.ClientId then
-                        pollUrl = pollUrl .. "?clientId=" .. self.ClientId
-                    end
+                    local pollUrl = BuildHttpBridgeUrl("/poll", {
+                        clientId = self.ClientId
+                    })
                     local response = request({
                         Url = pollUrl,
-                        Method = "GET"
+                        Method = "GET",
+                        Headers = BuildBridgeHeaders()
                     })
 
                     --// Server might be down \\--
@@ -661,11 +723,11 @@ local HTTPBridge = setmetatable({}, {__index = BaseBridge}); do
                         
                         --// Send response back \\--
                         request({
-                            Url = "http://" .. BridgeURL .. "/respond",
+                            Url = BuildHttpBridgeUrl("/respond"),
                             Method = "POST",
-                            Headers = {
+                            Headers = BuildBridgeHeaders({
                                 ["Content-Type"] = "application/json"
-                            },
+                            }),
                             Body = HttpService:JSONEncode(result)
                         })
                     end
