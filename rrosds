@@ -3,6 +3,7 @@ local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 local CollectionService = game:GetService("CollectionService")
+local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 local Framework = require(ReplicatedStorage:WaitForChild("MultiboxFramework"))
@@ -12,19 +13,27 @@ while not Framework.Loaded do
     RunService.Heartbeat:Wait()
 end
 
+local DataRemote = ReplicatedStorage:WaitForChild("NetworkingContainer"):WaitForChild("DataRemote")
+local Identifiers = ReplicatedStorage:WaitForChild("IdentifiersContainer")
 local EggModels = ReplicatedStorage:WaitForChild("Assets"):WaitForChild("EggModels")
 local Plots = Workspace:WaitForChild("Plots")
 local PlacedItems = Workspace:WaitForChild("PlacedItems")
 local DebrisFolder = Workspace:WaitForChild("Debris")
+local ConveyorPart = Workspace:WaitForChild("ConveyorPart")
+local SellZone = Workspace:WaitForChild("Zones"):WaitForChild("SellZone")
 
 local Config = {
     Goal = 1000000,
-    ScanInterval = 1.0,
-    ToolTimeout = 5.0,
+    IdleDelay = 0.12,
+    BuyTimeout = 1.5,
+    PlaceTimeout = 1.5,
+    SellTimeout = 1.5,
+    PromptPreDelay = 0.15,
+    PromptPostDelay = 0.45,
+    TeleportYOffset = 4,
+    TeleportForwardOffset = 3,
     PlaceStep = 4.0,
     PlacePadding = 4.0,
-    PromptDelay = 0.55,
-    HatchDelay = 0.75,
     Costs = {
         BasicEgg = 20,
         RareEgg = 125,
@@ -35,6 +44,11 @@ local Config = {
     },
 }
 
+local NilIdentifier = Identifiers:WaitForChild("NilIdentifier").Value
+local FuncSuccessIdentifier = Identifiers:WaitForChild("NetworkFunc_Success").Value
+local FuncNoFunctionIdentifier = Identifiers:WaitForChild("NetworkFunc_NoFunctionAvailble").Value
+local FuncErroredIdentifier = Identifiers:WaitForChild("NetworkFunc_Errored").Value
+
 local function log(...)
     print("[egg-bot]", ...)
 end
@@ -43,23 +57,7 @@ local function warnf(...)
     warn("[egg-bot]", ...)
 end
 
-local function safeInvoke(action, ...)
-    local packedArgs = table.pack(...)
-    local packedResult
-
-    local ok, err = pcall(function()
-        packedResult = table.pack(Framework.Network.Invoke(action, table.unpack(packedArgs, 1, packedArgs.n)))
-    end)
-
-    if not ok then
-        warnf("Network invoke failed:", action, err)
-        return false, err
-    end
-
-    return true, table.unpack(packedResult, 1, packedResult.n)
-end
-
-local function promptExists()
+local function promptApiAvailable()
     return typeof(fireproximityprompt) == "function"
 end
 
@@ -72,15 +70,125 @@ local function getHumanoid()
     return character:FindFirstChildOfClass("Humanoid")
 end
 
+local function getRootPart()
+    local character = getCharacter()
+    return character:WaitForChild("HumanoidRootPart")
+end
+
 local function waitUntil(predicate, timeout)
     local deadline = os.clock() + timeout
     while os.clock() < deadline do
         if predicate() then
             return true
         end
-        task.wait(0.05)
+        task.wait(0.03)
     end
     return false
+end
+
+local function stripDashesGuidToBinary()
+    local guid = HttpService:GenerateGUID(false):gsub("-", "")
+    return (guid:gsub("..", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+local function getIdentifier(name)
+    local node = Identifiers:FindFirstChild(name)
+    return node and node.Value or nil
+end
+
+local function hashActionName(actionName)
+    return Framework.Hash.sha512_256(actionName)
+end
+
+local function getFunctionIdentifiers(actionName)
+    local hash = hashActionName(actionName)
+    local sendId = getIdentifier("RF_" .. hash .. "_S")
+    local receiveId = getIdentifier("RF_" .. hash .. "_R")
+    return sendId, receiveId
+end
+
+local function rawInvoke(actionName, ...)
+    local sendId, receiveId = getFunctionIdentifiers(actionName)
+    if not sendId or not receiveId then
+        return false, "missing identifiers for " .. tostring(actionName)
+    end
+
+    local requestId = stripDashesGuidToBinary()
+    local packet = { sendId, requestId }
+    local argCount = select("#", ...)
+    for i = 1, argCount do
+        local value = select(i, ...)
+        packet[#packet + 1] = value == nil and NilIdentifier or value
+    end
+
+    local done = false
+    local responseStatus = nil
+    local responsePack = table.pack()
+
+    local connection
+    connection = DataRemote.OnClientEvent:Connect(function(batch)
+        if typeof(batch) ~= "table" then
+            return
+        end
+
+        for _, incoming in pairs(batch) do
+            if typeof(incoming) == "table" and incoming[1] == receiveId and incoming[2] == requestId then
+                responseStatus = incoming[3]
+                local n = 0
+                for i = 4, #incoming do
+                    n = n + 1
+                    local value = incoming[i]
+                    responsePack[n] = value == NilIdentifier and nil or value
+                end
+                responsePack.n = n
+                done = true
+                if connection then
+                    connection:Disconnect()
+                    connection = nil
+                end
+                return
+            end
+        end
+    end)
+
+    local sendOk, sendErr = pcall(function()
+        DataRemote:FireServer({ packet })
+    end)
+
+    if not sendOk then
+        if connection then
+            connection:Disconnect()
+        end
+        return false, sendErr
+    end
+
+    local gotResponse = waitUntil(function()
+        return done
+    end, 4.0)
+
+    if connection then
+        connection:Disconnect()
+    end
+
+    if not gotResponse then
+        return false, "invoke timeout for " .. tostring(actionName)
+    end
+
+    if responseStatus == FuncSuccessIdentifier then
+        return true, table.unpack(responsePack, 1, responsePack.n)
+    end
+
+    if responseStatus == FuncNoFunctionIdentifier then
+        return false, "server has no function for " .. tostring(actionName)
+    end
+
+    if responseStatus == FuncErroredIdentifier then
+        return false, "server errored for " .. tostring(actionName)
+    end
+
+    return false, "unknown invoke response for " .. tostring(actionName)
 end
 
 local function getBalance()
@@ -132,17 +240,43 @@ local function getToolsByType(itemType)
     return out
 end
 
-local function waitForEggTool(expectedInternalName, timeout)
-    local deadline = os.clock() + timeout
-    while os.clock() < deadline do
-        for _, tool in ipairs(getToolsByType("Eggs")) do
-            if tool:GetAttribute("Name") == expectedInternalName then
-                return tool
-            end
+local function findEggToolByInternalName(internalName)
+    for _, tool in ipairs(getToolsByType("Eggs")) do
+        if tool:GetAttribute("Name") == internalName then
+            return tool
         end
-        task.wait(0.05)
     end
     return nil
+end
+
+local function teleportToCFrame(targetCFrame)
+    local root = getRootPart()
+    root.CFrame = targetCFrame
+    task.wait(0.08)
+end
+
+local function teleportNearPart(part)
+    local target = part.CFrame * CFrame.new(0, Config.TeleportYOffset, Config.TeleportForwardOffset)
+    teleportToCFrame(target)
+end
+
+local function teleportToPlot()
+    local plot = getPlayerPlot()
+    if not plot then
+        return false
+    end
+
+    local topY = plot.Position.Y + (plot.Size.Y / 2) + Config.TeleportYOffset
+    teleportToCFrame(CFrame.new(plot.Position.X, topY, plot.Position.Z))
+    return true
+end
+
+local function teleportToConveyor()
+    teleportNearPart(ConveyorPart)
+end
+
+local function teleportToSellZone()
+    teleportNearPart(SellZone)
 end
 
 local function equipTool(tool)
@@ -157,45 +291,9 @@ local function equipTool(tool)
     end
 
     humanoid:EquipTool(tool)
-
     return waitUntil(function()
         return tool.Parent == character
     end, 1.0)
-end
-
-local function getConveyorEggs()
-    local ok, eggs = safeInvoke("EggConveyor_GetEggs")
-    if not ok or type(eggs) ~= "table" then
-        return {}
-    end
-    return eggs
-end
-
-local function chooseTargetEgg(balance, eggs)
-    local priority
-
-    if balance < Config.Costs.RareEgg then
-        priority = { "BasicEgg" }
-    elseif balance < Config.Costs.OverloadEgg then
-        priority = { "RareEgg", "BasicEgg" }
-    elseif balance < Config.Costs.LegendaryEgg then
-        priority = { "OverloadEgg", "RareEgg" }
-    elseif balance < Config.Costs.AstroEgg then
-        priority = { "LegendaryEgg", "OverloadEgg" }
-    else
-        priority = { "AstroEgg", "LegendaryEgg" }
-    end
-
-    for _, targetId in ipairs(priority) do
-        for _, egg in ipairs(eggs) do
-            local cost = Config.Costs[egg.id]
-            if egg.id == targetId and cost and balance >= cost then
-                return egg
-            end
-        end
-    end
-
-    return nil
 end
 
 local function countOwnedPlacedEggs()
@@ -258,6 +356,7 @@ end
 local function iteratePlacementCFrames(plot)
     local candidates = {}
     local _, yaw, _ = plot.CFrame:ToOrientation()
+    local topY = plot.Position.Y + (plot.Size.Y / 2)
 
     local minX = -plot.Size.X / 2 + Config.PlacePadding
     local maxX = plot.Size.X / 2 - Config.PlacePadding
@@ -267,7 +366,7 @@ local function iteratePlacementCFrames(plot)
     for x = minX, maxX, Config.PlaceStep do
         for z = minZ, maxZ, Config.PlaceStep do
             local worldPosition = (plot.CFrame * CFrame.new(x, 0, z)).Position
-            candidates[#candidates + 1] = CFrame.new(worldPosition.X, plot.Position.Y, worldPosition.Z) * CFrame.Angles(0, yaw, 0)
+            candidates[#candidates + 1] = CFrame.new(worldPosition.X, topY, worldPosition.Z) * CFrame.Angles(0, yaw, 0)
         end
     end
 
@@ -294,73 +393,191 @@ local function findNextValidPlacementCFrame(tool)
     return nil
 end
 
-local function buyEggByUID(uid)
-    log("Buying egg UID:", uid)
-    local transportOk, serverOk, serverErr = safeInvoke("EggConveyor_BuyEgg", uid)
-    if not transportOk then
-        return false, serverOk
+local function getConveyorEggs()
+    local ok, eggsOrErr = rawInvoke("EggConveyor_GetEggs")
+    if not ok or type(eggsOrErr) ~= "table" then
+        return {}
     end
-    if serverOk == false then
-        return false, serverErr or "server rejected egg buy"
-    end
-    return true, serverOk, serverErr
+    return eggsOrErr
 end
 
-local function placeEggAt(targetCFrame)
-    log("Placing egg at:", targetCFrame.Position)
-    local transportOk, serverOk, serverErr = safeInvoke("PlaceObjectRequest", targetCFrame)
-    if not transportOk then
-        return false, serverOk
+local function conveyorStillHasUID(uid)
+    for _, egg in ipairs(getConveyorEggs()) do
+        if egg.uid == uid then
+            return true
+        end
     end
-    if serverOk == false then
-        return false, serverErr or "server rejected placement"
-    end
-    return true, serverOk, serverErr
+    return false
 end
 
-local function placeToolStack(tool)
-    while tool and tool.Parent do
-        if not equipTool(tool) then
-            return false, "failed to equip egg tool"
+local function chooseTargetEgg(balance, eggs)
+    local priority
+
+    if balance < Config.Costs.RareEgg then
+        priority = { "BasicEgg" }
+    elseif balance < Config.Costs.OverloadEgg then
+        priority = { "RareEgg", "BasicEgg" }
+    elseif balance < Config.Costs.LegendaryEgg then
+        priority = { "OverloadEgg", "RareEgg" }
+    elseif balance < Config.Costs.AstroEgg then
+        priority = { "LegendaryEgg", "OverloadEgg" }
+    else
+        priority = { "AstroEgg", "LegendaryEgg" }
+    end
+
+    for _, targetId in ipairs(priority) do
+        for _, egg in ipairs(eggs) do
+            local cost = Config.Costs[egg.id]
+            if egg.id == targetId and cost and balance >= cost then
+                return egg
+            end
         end
+    end
 
-        local targetCFrame = findNextValidPlacementCFrame(tool)
-        if not targetCFrame then
-            return false, "no valid placement point found"
+    return nil
+end
+
+local function findConveyorPromptForEggId(eggId)
+    local itemConfig = Framework.Inventory.GetItemConfig("Eggs", eggId)
+    if not itemConfig then
+        return nil
+    end
+
+    local conveyorEggs = Workspace:FindFirstChild("ConveyorEggs")
+    if not conveyorEggs then
+        return nil
+    end
+
+    for _, descendant in ipairs(conveyorEggs:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt") and descendant.Enabled and descendant.ActionText == itemConfig.DisplayName then
+            return descendant
         end
+    end
 
-        local beforeCount = countOwnedPlacedEggs()
-        local ok = placeEggAt(targetCFrame)
-        if not ok then
-            return false, "place invoke failed"
+    return nil
+end
+
+local function triggerPrompt(prompt)
+    if not promptApiAvailable() then
+        return false
+    end
+
+    local base = prompt.Parent
+    local targetCFrame
+
+    if base and base:IsA("BasePart") then
+        targetCFrame = base.CFrame * CFrame.new(0, Config.TeleportYOffset, Config.TeleportForwardOffset)
+    elseif base and base:IsA("Model") then
+        targetCFrame = base:GetPivot() * CFrame.new(0, Config.TeleportYOffset, Config.TeleportForwardOffset)
+    else
+        return false
+    end
+
+    teleportToCFrame(targetCFrame)
+    task.wait(Config.PromptPreDelay)
+    fireproximityprompt(prompt)
+    task.wait(Config.PromptPostDelay)
+    return true
+end
+
+local function buyEggByUID(conveyorEgg)
+    teleportToConveyor()
+
+    local balanceBefore = getBalance()
+    local hadToolBefore = findEggToolByInternalName(conveyorEgg.id) ~= nil
+    log("Buying egg:", conveyorEgg.id, conveyorEgg.uid)
+
+    local ok, err = rawInvoke("EggConveyor_BuyEgg", conveyorEgg.uid)
+    if not ok then
+        warnf("Raw buy failed, trying prompt fallback:", err)
+
+        local prompt = findConveyorPromptForEggId(conveyorEgg.id)
+        if not prompt or not triggerPrompt(prompt) then
+            return false, err or "buy failed and no prompt fallback"
         end
+    end
 
-        local placed = waitUntil(function()
-            return countOwnedPlacedEggs() > beforeCount or tool.Parent == nil
-        end, 1.5)
-
-        if not placed then
-            return false, "placement had no visible world change"
+    local confirmed = waitUntil(function()
+        if getBalance() < balanceBefore then
+            return true
         end
+        if not conveyorStillHasUID(conveyorEgg.uid) then
+            return true
+        end
+        if not hadToolBefore and findEggToolByInternalName(conveyorEgg.id) then
+            return true
+        end
+        return false
+    end, Config.BuyTimeout)
 
-        task.wait(0.1)
+    if not confirmed then
+        return false, "buy had no visible confirmation"
     end
 
     return true
 end
 
-local function buyAndPlaceEgg(conveyorEgg)
-    local bought, buyErr = buyEggByUID(conveyorEgg.uid)
-    if not bought then
-        return false, buyErr or "buy invoke failed"
+local function placeEggAt(targetCFrame)
+    return rawInvoke("PlaceObjectRequest", targetCFrame)
+end
+
+local function placeToolStack(tool)
+    local plantedAnything = false
+
+    teleportToPlot()
+
+    while tool and tool.Parent do
+        if not equipTool(tool) then
+            return plantedAnything, "failed to equip egg tool"
+        end
+
+        local targetCFrame = findNextValidPlacementCFrame(tool)
+        if not targetCFrame then
+            return plantedAnything, "no valid placement point found"
+        end
+
+        local beforeCount = countOwnedPlacedEggs()
+        local ok, err = placeEggAt(targetCFrame)
+        if not ok then
+            return plantedAnything, err or "place invoke failed"
+        end
+
+        local placed = waitUntil(function()
+            return countOwnedPlacedEggs() > beforeCount or tool.Parent == nil
+        end, Config.PlaceTimeout)
+
+        if not placed then
+            return plantedAnything, "placement had no visible world change"
+        end
+
+        plantedAnything = true
+        task.wait(0.05)
     end
 
-    local tool = waitForEggTool(conveyorEgg.id, Config.ToolTimeout)
-    if not tool then
-        return false, "egg tool did not appear after buy"
+    return plantedAnything
+end
+
+local function placeAllOwnedEggTools()
+    local progressed = false
+
+    while true do
+        local tools = getToolsByType("Eggs")
+        if #tools == 0 then
+            break
+        end
+
+        local planted, err = placeToolStack(tools[1])
+        if not planted then
+            if err then
+                warnf("place stack stopped:", err)
+            end
+            break
+        end
+
+        progressed = true
     end
 
-    return placeToolStack(tool)
+    return progressed
 end
 
 local function findPromptRecursive(root, actionText)
@@ -373,9 +590,12 @@ local function findPromptRecursive(root, actionText)
 end
 
 local function hatchAllReady()
-    if not promptExists() then
-        return
+    if not promptApiAvailable() then
+        return false
     end
+
+    local progressed = false
+    teleportToPlot()
 
     for _, item in ipairs(PlacedItems:GetChildren()) do
         if item:GetAttribute("OwnerId") == LocalPlayer.UserId and item:GetAttribute("Type") == "Eggs" then
@@ -384,17 +604,19 @@ local function hatchAllReady()
                 local prompt = findPromptRecursive(item, "Hatch!")
                 if prompt then
                     log("Hatching:", item.Name)
-                    fireproximityprompt(prompt)
-                    task.wait(Config.HatchDelay)
+                    triggerPrompt(prompt)
+                    progressed = true
                 end
             end
         end
     end
+
+    return progressed
 end
 
 local function pickUpAll()
-    if not promptExists() then
-        return
+    if not promptApiAvailable() then
+        return false
     end
 
     local humanoid = getHumanoid()
@@ -402,64 +624,123 @@ local function pickUpAll()
         humanoid:UnequipTools()
     end
 
+    local progressed = false
+    teleportToPlot()
+
     for _, prompt in ipairs(CollectionService:GetTagged("PickUpToiletPrompt")) do
         if prompt:IsA("ProximityPrompt") and prompt.Enabled then
             local ownerModel = prompt:FindFirstAncestorOfClass("Model")
             if ownerModel and ownerModel:GetAttribute("OwnerId") == LocalPlayer.UserId then
                 log("Picking up:", ownerModel.Name)
-                fireproximityprompt(prompt)
-                task.wait(Config.PromptDelay)
+                triggerPrompt(prompt)
+                progressed = true
             end
         end
     end
+
+    return progressed
 end
 
 local function sellEverything()
-    log("Selling all items")
-    local transportOk, serverOk, serverErr = safeInvoke("SellAllItems")
-    if not transportOk then
-        return false, serverOk
+    local toiletTools = getToolsByType("Toilets")
+    if #toiletTools == 0 then
+        return false
     end
-    if serverOk == false then
-        return false, serverErr or "server rejected sell"
+
+    teleportToSellZone()
+    log("Selling all toilets:", #toiletTools)
+
+    local balanceBefore = getBalance()
+    local ok, err = rawInvoke("SellAllItems")
+    if not ok then
+        warnf("sell failed:", err)
+        return false
     end
-    return true, serverOk, serverErr
+
+    local sold = waitUntil(function()
+        return #getToolsByType("Toilets") < #toiletTools or getBalance() > balanceBefore
+    end, Config.SellTimeout)
+
+    teleportToPlot()
+    return sold
 end
 
-local function cleanCycle()
-    pickUpAll()
-    hatchAllReady()
-    sellEverything()
+local function buyBatch()
+    if #getToolsByType("Eggs") > 0 then
+        return false
+    end
+
+    local progressed = false
+    teleportToConveyor()
+
+    while true do
+        local balance = getBalance()
+        local eggs = getConveyorEggs()
+        local target = chooseTargetEgg(balance, eggs)
+
+        if not target then
+            break
+        end
+
+        local bought, err = buyEggByUID(target)
+        if not bought then
+            warnf("buy failed:", err)
+            break
+        end
+
+        progressed = true
+    end
+
+    return progressed
+end
+
+local function runActionPump()
+    local didSomething = false
+
+    if placeAllOwnedEggTools() then
+        didSomething = true
+    end
+
+    if hatchAllReady() then
+        didSomething = true
+    end
+
+    if pickUpAll() then
+        didSomething = true
+    end
+
+    if sellEverything() then
+        didSomething = true
+    end
+
+    if buyBatch() then
+        didSomething = true
+        if placeAllOwnedEggTools() then
+            didSomething = true
+        end
+    end
+
+    return didSomething
 end
 
 task.spawn(function()
     while true do
-        task.wait(Config.ScanInterval)
-
         local ok, err = pcall(function()
-            cleanCycle()
-
-            local balance = getBalance()
-            if balance >= Config.Goal then
-                log("Goal reached:", balance)
+            if getBalance() >= Config.Goal then
+                log("Goal reached:", getBalance())
                 task.wait(5)
                 return
             end
 
-            local eggs = getConveyorEggs()
-            local target = chooseTargetEgg(balance, eggs)
-            if not target then
-                return
-            end
-
-            local success, placeErr = buyAndPlaceEgg(target)
-            if not success then
-                warnf("Buy/place chain failed:", placeErr)
+            local progressed = runActionPump()
+            if not progressed then
+                task.wait(Config.IdleDelay)
             end
         end)
 
         if not ok then
-            warnf("Main loop error:", err)
+            warnf("main loop error:", err)
+            task.wait(0.25)
         end
     end
 end)
